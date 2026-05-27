@@ -48,6 +48,25 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "simulate_fill",
+        "description": (
+            "Walk the order book to compute the realistic fill price (VWAP) and slippage for "
+            "a target dollar size. ALWAYS call this before sizing a non-trivial bet — best-ask "
+            "is fine for $50 but lies for $5K. Use the returned `vwap` as `p_market` in "
+            "size_with_kelly, not the best price. If `fully_filled` is false, the book is too "
+            "thin for your target; size down or skip."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "token_id": {"type": "string", "description": "Outcome token id from search_markets/get_market_prices."},
+                "dollar_target": {"type": "number", "minimum": 1, "description": "USDC amount you want to spend (BUY) or collect (SELL)."},
+                "side": {"type": "string", "enum": ["BUY", "SELL"], "default": "BUY"},
+            },
+            "required": ["token_id", "dollar_target"],
+        },
+    },
+    {
         "name": "check_arbitrage",
         "description": (
             "Check a market for risk-free arb (sum of outcome best-asks < 1 or best-bids > 1). "
@@ -230,6 +249,22 @@ def _get_market_prices(market_id: str) -> dict:
     }
 
 
+def _simulate_fill(token_id: str, dollar_target: float, side: str = "BUY") -> dict:
+    clob = _clob_client()
+    sim = clob.simulate_fill(token_id, dollar_target, side=side)
+    return {
+        "side": sim.side,
+        "target_dollar": sim.target_dollar,
+        "filled_dollar": round(sim.filled_dollar, 2),
+        "shares": round(sim.shares, 4),
+        "vwap": round(sim.vwap, 6) if sim.vwap is not None else None,
+        "best_price": sim.best_price,
+        "slippage_bps": round(sim.slippage_bps, 1) if sim.slippage_bps is not None else None,
+        "levels_consumed": sim.levels_consumed,
+        "fully_filled": sim.fully_filled,
+    }
+
+
 def _check_arbitrage(market_id: str) -> dict | None:
     gamma = _gamma_client()
     clob = _clob_client()
@@ -284,6 +319,7 @@ def _emit_signal(event_id: str | None = None, **kwargs) -> dict:
 _HANDLERS = {
     "search_markets": _search_markets,
     "get_market_prices": _get_market_prices,
+    "simulate_fill": _simulate_fill,
     "check_arbitrage": _check_arbitrage,
     "size_with_kelly": _size_with_kelly,
     "emit_signal": _emit_signal,

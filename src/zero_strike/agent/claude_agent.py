@@ -22,6 +22,7 @@ from anthropic import Anthropic
 from ..calibration import compute_stats, format_calibration_for_prompt, resolution_store
 from ..config import settings
 from ..execution.signal import signal_store
+from .budget import check_budget, daily_cap_usd, record_usage, spend_store
 from .news_feed import NewsItem
 from .tools import TOOLS, close_clients, run_tool
 
@@ -50,13 +51,20 @@ How you think:
    if your confidence interval is wider than the market spread, that's a "no bet" — say so
    in plain text and move on. Do not anchor to the market price.
 
-6. Call `size_with_kelly(p_true, p_market, event_id=<from market data>)`. ALWAYS pass
-   `event_id` when known — it's the Polymarket event the market belongs to, and the
-   sizing function uses it to haircut bets correlated with already-open positions in the
-   same event (e.g. multiple election markets that move together). If `dollar_size` is
-   0, the edge is below threshold or cluster cap is full — no bet.
+6. Before sizing, call `simulate_fill(token_id, dollar_target=<rough first guess>, side)`
+   to get the realistic VWAP. Best-ask is a lie for bets that walk the book. Use the
+   returned `vwap` (not the best price) as `p_market` in the next step. If `fully_filled`
+   is false, the book is too thin — size down or skip.
 
-7. If sized > 0, call `emit_signal` with full rationale, `event_id`, and the URLs of
+7. Call `size_with_kelly(p_true, p_market=<vwap from simulate_fill>, event_id=<from market data>)`.
+   ALWAYS pass `event_id` when known — it's the Polymarket event the market belongs to,
+   and the sizing function uses it to haircut bets correlated with already-open positions
+   in the same event (e.g. multiple election markets that move together). If `dollar_size`
+   is 0, the edge is below threshold or cluster cap is full — no bet. If the new
+   `dollar_size` differs materially from your `simulate_fill` target, call simulate_fill
+   again with the actual size to verify VWAP doesn't shift — then re-Kelly if it does.
+
+8. If sized > 0, call `emit_signal` with full rationale, `event_id`, and the URLs of
    the news items that drove it. Reference at least one specific concrete fact from
    the news — generic reasoning is not signal.
 
@@ -84,6 +92,12 @@ def run_agent_on_news(items: Iterable[NewsItem], *, max_steps: int = 40, verbose
     if not settings.anthropic_api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not set — cannot run agent.")
 
+    ok, msg = check_budget()
+    if not ok:
+        if verbose:
+            print(f"[budget] BLOCKED — {msg}")
+        return {"stop": "budget_cap", "reason": msg, "tool_calls": 0, "steps": 0}
+
     client = Anthropic(api_key=settings.anthropic_api_key)
     system_prompt = _build_system_prompt()
 
@@ -101,6 +115,8 @@ def run_agent_on_news(items: Iterable[NewsItem], *, max_steps: int = 40, verbose
     messages: list[dict] = [{"role": "user", "content": user_intro}]
     tool_calls = 0
     steps = 0
+    run_cost = 0.0
+    budget_aborted = False
 
     while steps < max_steps:
         steps += 1
@@ -112,6 +128,8 @@ def run_agent_on_news(items: Iterable[NewsItem], *, max_steps: int = 40, verbose
                    for i, t in enumerate(TOOLS)],
             messages=messages,
         )
+        rec = record_usage(settings.anthropic_model, resp.usage)
+        run_cost += rec.cost_usd
 
         assistant_blocks: list[dict] = []
         tool_results: list[dict] = []
@@ -150,15 +168,28 @@ def run_agent_on_news(items: Iterable[NewsItem], *, max_steps: int = 40, verbose
             break
         if not tool_results:
             break
+
+        # Mid-loop budget check — if we crossed the cap, stop after recording
+        # the last assistant turn but before another expensive prefill.
+        ok, msg = check_budget()
+        if not ok:
+            if verbose:
+                print(f"[budget] mid-loop abort — {msg}")
+            budget_aborted = True
+            break
+
         messages.append({"role": "user", "content": tool_results})
 
     close_clients()
     return {
-        "stop": resp.stop_reason,
+        "stop": "budget_cap" if budget_aborted else resp.stop_reason,
         "tool_calls": tool_calls,
         "steps": steps,
         "input_tokens": resp.usage.input_tokens,
         "output_tokens": resp.usage.output_tokens,
         "cache_creation_tokens": getattr(resp.usage, "cache_creation_input_tokens", 0),
         "cache_read_tokens": getattr(resp.usage, "cache_read_input_tokens", 0),
+        "run_cost_usd": round(run_cost, 4),
+        "daily_spend_after": round(spend_store.spend_today(), 4),
+        "daily_cap_usd": daily_cap_usd(),
     }

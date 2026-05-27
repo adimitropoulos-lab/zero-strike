@@ -10,6 +10,7 @@ Commands:
   calibration  Show Brier / hit-rate / PnL / reliability buckets.
   backtest     Replay resolved signals under different sizing parameters.
   portfolio    Show open exposure by event (cluster view).
+  budget       Show Anthropic spend (today + last 14d) vs daily cap.
   run          One-click: run arb + agent + traders + resolution loops forever.
   signals      List recorded signals.
   config       Print resolved settings.
@@ -23,6 +24,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from .agent.budget import daily_cap_usd, spend_store
 from .analytics import compute_edge, scan_top_wallets, select_repeatable_edge
 from .arb import scan_arbitrage
 from .backtest import sweep_parameters
@@ -291,6 +293,28 @@ def portfolio():
         markets = ", ".join(sorted({i["market_id"][:10] for i in items}))[:60]
         table.add_row(event_id[:16], str(len(items)), f"${total:,.2f}", markets)
     console.print(table)
+
+
+@app.command()
+def budget(days: int = typer.Option(14, help="Look back this many days.")):
+    """Show Anthropic spend vs daily cap."""
+    cap = daily_cap_usd()
+    today_spend = spend_store.spend_today()
+    pct = (today_spend / cap * 100) if cap > 0 else 0
+    summary = Table("Metric", "Value")
+    summary.add_row("daily cap (USD)", f"${cap:.2f}")
+    summary.add_row("spend today (USD)", f"${today_spend:.4f}")
+    summary.add_row("% of cap", f"{pct:.1f}%")
+    summary.add_row("remaining today", f"${max(0, cap - today_spend):.4f}")
+    console.print(summary)
+
+    by_day = spend_store.spend_by_day()
+    if by_day:
+        recent = sorted(by_day.items(), reverse=True)[:days]
+        history = Table("Date (UTC)", "Spend (USD)")
+        for d, v in recent:
+            history.add_row(d, f"${v:.4f}")
+        console.print(history)
 
 
 @app.command()
