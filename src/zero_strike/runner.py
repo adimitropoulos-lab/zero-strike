@@ -25,6 +25,7 @@ from rich.console import Console
 from .agent import run_agent
 from .analytics import compute_edge, scan_top_wallets, select_repeatable_edge
 from .arb import scan_arbitrage
+from .calibration.daemon import sweep_once
 from .execution.signal import Signal, signal_store
 from .polymarket import SubgraphClient
 
@@ -39,12 +40,14 @@ class Runner:
         arb_interval: int = 60,
         agent_interval: int = 300,
         traders_interval: int = 86_400,
+        resolution_interval: int = 3600,
         agent_news_window: int = 600,
         webhook_url: str | None = None,
     ):
         self.arb_interval = arb_interval
         self.agent_interval = agent_interval
         self.traders_interval = traders_interval
+        self.resolution_interval = resolution_interval
         self.agent_news_window = agent_news_window
         self.webhook_url = webhook_url or os.getenv("SIGNAL_WEBHOOK_URL")
         self._last_signal_count = len(signal_store.read())
@@ -56,7 +59,7 @@ class Runner:
 
     async def _every(self, name: str, interval: int, fn: Callable[[], Awaitable[None]]) -> None:
         # Stagger initial fires so they don't all hit the network at once.
-        await asyncio.sleep({"arb": 1, "agent": 3, "traders": 5}.get(name, 0))
+        await asyncio.sleep({"arb": 1, "agent": 3, "traders": 5, "resolution": 7}.get(name, 0))
         while not self._stop.is_set():
             t0 = time.monotonic()
             try:
@@ -126,6 +129,17 @@ class Runner:
             + "[/]"
         )
 
+    async def _resolution_cycle(self) -> None:
+        result = await asyncio.to_thread(sweep_once)
+        if result.scanned == 0 and result.newly_resolved == 0:
+            console.print(f"[dim][{_ts()}] [resolve] nothing to settle[/]")
+            return
+        console.print(
+            f"[blue][{_ts()}] [resolve] scanned={result.scanned} "
+            f"resolved={result.newly_resolved} still_open={result.still_open} "
+            f"errors={result.errors} cum_pnl=${result.cumulative_pnl:,.0f}[/]"
+        )
+
     async def _flush_new_signals(self) -> None:
         all_sigs = signal_store.read()
         new = all_sigs[self._last_signal_count :]
@@ -145,12 +159,14 @@ class Runner:
         console.print(
             f"[bold]Zero-Strike runner up — arb/{self.arb_interval}s, "
             f"agent/{self.agent_interval}s, traders/{self.traders_interval}s, "
+            f"resolve/{self.resolution_interval}s, "
             f"webhook={'on' if self.webhook_url else 'off'}[/]"
         )
         await asyncio.gather(
             self._every("arb", self.arb_interval, self._arb_cycle),
             self._every("agent", self.agent_interval, self._agent_cycle),
             self._every("traders", self.traders_interval, self._traders_cycle),
+            self._every("resolution", self.resolution_interval, self._resolution_cycle),
         )
 
 

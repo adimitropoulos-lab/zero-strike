@@ -6,7 +6,9 @@ Commands:
   arb          Scan active markets for mispricing (sum of outcomes ≠ 1).
   kelly        One-shot Kelly sizing for a (p_true, p_market) pair.
   agent        Run the news-driven agent loop (fetch RSS → Claude → signals).
-  run          One-click: run arb + agent + traders loops forever.
+  resolve      Settle any signals whose markets have closed.
+  calibration  Show Brier / hit-rate / PnL / reliability buckets.
+  run          One-click: run arb + agent + traders + resolution loops forever.
   signals      List recorded signals.
   config       Print resolved settings.
 """
@@ -21,6 +23,8 @@ from rich.table import Table
 
 from .analytics import compute_edge, scan_top_wallets, select_repeatable_edge
 from .arb import scan_arbitrage
+from .calibration import compute_stats, resolution_store
+from .calibration.daemon import sweep_once
 from .config import settings
 from .execution.signal import signal_store
 from .polymarket import SubgraphClient
@@ -155,19 +159,69 @@ def run(
     arb_interval: int = typer.Option(60, help="Arb scan cadence in seconds."),
     agent_interval: int = typer.Option(300, help="News→agent cadence in seconds."),
     traders_interval: int = typer.Option(86_400, help="Top-7 cohort refresh cadence in seconds."),
+    resolution_interval: int = typer.Option(3600, help="Resolution-sweep cadence in seconds."),
     agent_news_window: int = typer.Option(600, help="How far back the agent reads news, in seconds."),
     webhook: str = typer.Option(None, help="Optional URL to POST each new signal as JSON."),
 ):
-    """One-click: run arb + agent + traders loops forever (Ctrl-C to stop)."""
+    """One-click: run arb + agent + traders + resolution loops forever (Ctrl-C to stop)."""
     from .runner import run_forever
 
     run_forever(
         arb_interval=arb_interval,
         agent_interval=agent_interval,
         traders_interval=traders_interval,
+        resolution_interval=resolution_interval,
         agent_news_window=agent_news_window,
         webhook_url=webhook,
     )
+
+
+@app.command()
+def resolve():
+    """One-shot: settle any signals whose markets have closed."""
+    result = sweep_once()
+    table = Table("Field", "Value")
+    table.add_row("scanned (open before sweep)", str(result.scanned))
+    table.add_row("newly resolved", str(result.newly_resolved))
+    table.add_row("still open", str(result.still_open))
+    table.add_row("fetch errors", str(result.errors))
+    table.add_row("cumulative realized PnL", f"${result.cumulative_pnl:,.2f}")
+    console.print(table)
+
+
+@app.command()
+def calibration():
+    """Brier / hit-rate / realized PnL / reliability buckets across all resolved signals."""
+    sigs = signal_store.read()
+    res = resolution_store.latest_by_signal()
+    stats = compute_stats(sigs, res)
+
+    summary = Table("Metric", "Value")
+    summary.add_row("signals", str(stats.n_signals))
+    summary.add_row("resolved", str(stats.n_resolved))
+    summary.add_row("Brier", f"{stats.brier:.4f}" if stats.brier is not None else "—")
+    summary.add_row("hit rate", f"{stats.hit_rate*100:.1f}%" if stats.hit_rate is not None else "—")
+    summary.add_row("realized PnL", f"${stats.realized_pnl_usd:,.2f}")
+    summary.add_row("avg edge (bps)", f"{stats.avg_edge_bps:+.0f}")
+    console.print(summary)
+
+    if stats.n_resolved == 0:
+        console.print("[yellow]No resolved signals yet — let it run.[/]")
+        return
+
+    buckets = Table("p_true range", "n", "predicted", "actual", "drift")
+    for bk in stats.buckets:
+        if bk.n == 0:
+            continue
+        drift = bk.actual_rate - bk.predicted_mean
+        buckets.add_row(
+            bk.label(),
+            str(bk.n),
+            f"{bk.predicted_mean:.2f}",
+            f"{bk.actual_rate:.2f}",
+            f"{drift:+.2f}",
+        )
+    console.print(buckets)
 
 
 @app.command()

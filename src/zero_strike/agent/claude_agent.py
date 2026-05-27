@@ -19,7 +19,9 @@ from typing import Iterable
 
 from anthropic import Anthropic
 
+from ..calibration import compute_stats, format_calibration_for_prompt, resolution_store
 from ..config import settings
+from ..execution.signal import signal_store
 from .news_feed import NewsItem
 from .tools import TOOLS, close_clients, run_tool
 
@@ -67,12 +69,20 @@ Constraints:
 Stop when you have processed every news item that warranted action. Then end the turn."""
 
 
+def _build_system_prompt() -> str:
+    """Base prompt + (when we have ≥10 resolved signals) the agent's own track record."""
+    stats = compute_stats(signal_store.read(), resolution_store.latest_by_signal())
+    suffix = format_calibration_for_prompt(stats)
+    return SYSTEM_PROMPT + suffix
+
+
 def run_agent_on_news(items: Iterable[NewsItem], *, max_steps: int = 40, verbose: bool = True) -> dict:
     """Run the agent until end_turn or max_steps. Returns a run summary."""
     if not settings.anthropic_api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not set — cannot run agent.")
 
     client = Anthropic(api_key=settings.anthropic_api_key)
+    system_prompt = _build_system_prompt()
 
     news_block = "\n\n".join(f"- {it.as_text()}" for it in items)
     if not news_block.strip():
@@ -94,7 +104,7 @@ def run_agent_on_news(items: Iterable[NewsItem], *, max_steps: int = 40, verbose
         resp = client.messages.create(
             model=settings.anthropic_model,
             max_tokens=4096,
-            system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+            system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
             tools=[{**t, "cache_control": {"type": "ephemeral"}} if i == len(TOOLS) - 1 else t
                    for i, t in enumerate(TOOLS)],
             messages=messages,
