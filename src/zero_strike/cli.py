@@ -6,6 +6,7 @@ Commands:
   arb          Scan active markets for mispricing (sum of outcomes ≠ 1).
   kelly        One-shot Kelly sizing for a (p_true, p_market) pair.
   agent        Run the news-driven agent loop (fetch RSS → Claude → signals).
+  run          One-click: run arb + agent + traders loops forever.
   signals      List recorded signals.
   config       Print resolved settings.
 """
@@ -147,6 +148,26 @@ def agent(
     console.print(f"[bold]Agent run — last {since_minutes}m, ≤{max_news} items[/]")
     result = run_agent(since_seconds=since_minutes * 60, max_news=max_news, verbose=not quiet)
     console.print(json.dumps(result, indent=2))
+
+
+@app.command()
+def run(
+    arb_interval: int = typer.Option(60, help="Arb scan cadence in seconds."),
+    agent_interval: int = typer.Option(300, help="News→agent cadence in seconds."),
+    traders_interval: int = typer.Option(86_400, help="Top-7 cohort refresh cadence in seconds."),
+    agent_news_window: int = typer.Option(600, help="How far back the agent reads news, in seconds."),
+    webhook: str = typer.Option(None, help="Optional URL to POST each new signal as JSON."),
+):
+    """One-click: run arb + agent + traders loops forever (Ctrl-C to stop)."""
+    from .runner import run_forever
+
+    run_forever(
+        arb_interval=arb_interval,
+        agent_interval=agent_interval,
+        traders_interval=traders_interval,
+        agent_news_window=agent_news_window,
+        webhook_url=webhook,
+    )
 
 
 @app.command()

@@ -1,0 +1,9 @@
+services:
+  zero-strike:
+    build: .
+    container_name: zero-strike
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data
+    command: ["run"]
