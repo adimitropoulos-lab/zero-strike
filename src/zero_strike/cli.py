@@ -11,6 +11,12 @@ Commands:
   backtest     Replay resolved signals under different sizing parameters.
   portfolio    Show open exposure by event (cluster view).
   budget       Show Anthropic spend (today + last 14d) vs daily cap.
+  cohort       Show persisted 7-cohort and (optionally) recent fills.
+  metrics      Render Prometheus metrics once to stdout.
+  execute      Submit recent signals to Polymarket (dry-run by default).
+  halt         Halt live execution.
+  unhalt       Lift the halt flag.
+  live-log     Show recent live-execution records.
   run          One-click: run arb + agent + traders + resolution loops forever.
   signals      List recorded signals.
   config       Print resolved settings.
@@ -25,14 +31,30 @@ from rich.console import Console
 from rich.table import Table
 
 from .agent.budget import daily_cap_usd, spend_store
-from .analytics import compute_edge, scan_top_wallets, select_repeatable_edge
+from .analytics import (
+    CohortMember,
+    CohortSnapshot,
+    cohort_store,
+    compute_edge,
+    poll_new_activity,
+    scan_top_wallets,
+    select_repeatable_edge,
+)
 from .arb import scan_arbitrage
 from .backtest import sweep_parameters
 from .backtest.replay import replay
 from .calibration import compute_stats, resolution_store
 from .calibration.daemon import sweep_once
 from .config import settings
+from .execution import (
+    execute_recent_signals,
+    halt as halt_execution,
+    is_halted,
+    read_records as read_live_records,
+    unhalt as unhalt_execution,
+)
 from .execution.signal import signal_store
+from .observability import collect_metrics, render_prometheus
 from .polymarket import SubgraphClient
 from .sizing import kelly_size, open_exposure_by_event
 
@@ -67,6 +89,7 @@ def traders(
     pool: int = typer.Option(100, help="Top-PnL pool to score."),
     n: int = typer.Option(7, help="How many traders with repeatable edge to keep."),
     min_trades: int = typer.Option(25, help="Minimum trade count to be considered."),
+    persist: bool = typer.Option(True, help="Save the selected cohort so the agent can mirror it."),
 ):
     """Isolate the N traders whose edge is repeatable."""
     console.print(f"[bold]Mining repeatable edge — last {days}d, scoring top {pool} wallets[/]")
@@ -100,6 +123,61 @@ def traders(
     console.print(table)
     if not picks:
         console.print("[yellow]No wallets met the repeatable-edge bar — try lowering --min-trades.[/]")
+        return
+    if persist:
+        snap = CohortSnapshot(
+            selected_unix=int(time.time()),
+            lookback_days=days,
+            members=[
+                CohortMember(
+                    address=rep.address,
+                    composite_z=z,
+                    win_rate=rep.win_rate,
+                    n_trades=rep.n_trades,
+                    pnl_usd=rep.pnl_usd,
+                )
+                for rep, z, _ in picks
+            ],
+        )
+        cohort_store.save(snap)
+        console.print(f"[green]Cohort saved → {cohort_store.path}[/]")
+
+
+@app.command()
+def cohort(
+    activity: bool = typer.Option(False, help="Also show recent fills since last poll."),
+    lookback_seconds: int = typer.Option(3600, help="Activity lookback for --activity."),
+):
+    """Show the current 7-cohort (and optionally recent activity)."""
+    snap = cohort_store.load()
+    if snap is None:
+        console.print("[yellow]No cohort persisted yet — run `zero-strike traders` first.[/]")
+        return
+    t = Table("Rank", "Address", "Composite z", "Win%", "Trades", "PnL")
+    for i, m in enumerate(snap.members, 1):
+        t.add_row(
+            str(i), m.address, f"{m.composite_z:+.2f}",
+            f"{m.win_rate*100:.1f}", str(m.n_trades), f"${m.pnl_usd:,.0f}",
+        )
+    console.print(f"[bold]Cohort selected {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(snap.selected_unix))} "
+                  f"(lookback {snap.lookback_days}d)[/]")
+    console.print(t)
+    if activity:
+        fills = poll_new_activity(lookback_seconds=lookback_seconds)
+        if not fills:
+            console.print("[dim]No new activity since last poll.[/]")
+            return
+        a = Table("Time", "Address", "Side", "Token", "USDC", "Avg px")
+        for f in fills[:30]:
+            a.add_row(
+                time.strftime("%H:%M:%S", time.gmtime(f.timestamp)),
+                f.address[:10],
+                f.side,
+                f.token_id[:16],
+                f"${f.usdc_amount:,.0f}",
+                f"{f.avg_price:.4f}",
+            )
+        console.print(a)
 
 
 @app.command()
@@ -168,6 +246,7 @@ def run(
     resolution_interval: int = typer.Option(3600, help="Resolution-sweep cadence in seconds."),
     agent_news_window: int = typer.Option(600, help="How far back the agent reads news, in seconds."),
     webhook: str = typer.Option(None, help="Optional URL to POST each new signal as JSON."),
+    metrics_port: int = typer.Option(9090, help="Port for Prometheus /metrics endpoint (0 to disable)."),
 ):
     """One-click: run arb + agent + traders + resolution loops forever (Ctrl-C to stop)."""
     from .runner import run_forever
@@ -179,6 +258,7 @@ def run(
         resolution_interval=resolution_interval,
         agent_news_window=agent_news_window,
         webhook_url=webhook,
+        metrics_port=metrics_port if metrics_port > 0 else None,
     )
 
 
@@ -315,6 +395,68 @@ def budget(days: int = typer.Option(14, help="Look back this many days.")):
         for d, v in recent:
             history.add_row(d, f"${v:.4f}")
         console.print(history)
+
+
+@app.command()
+def metrics():
+    """Render Prometheus metrics once to stdout (same content as /metrics endpoint)."""
+    console.print(render_prometheus(collect_metrics()))
+
+
+@app.command()
+def execute(
+    live: bool = typer.Option(False, "--live", help="Actually submit orders (default: dry-run preview)."),
+    signal_max_age: int = typer.Option(1800, help="Skip signals older than N seconds."),
+):
+    """Submit recent signals to Polymarket. --live required for real submission."""
+    halted, hreason = is_halted()
+    if halted:
+        console.print(f"[red]HALTED — {hreason}. Run `zero-strike unhalt` after investigating.[/]")
+        if live:
+            raise typer.Exit(code=1)
+    if not live:
+        console.print("[yellow]DRY-RUN: showing what would be submitted. Pass --live to actually send.[/]")
+    results = execute_recent_signals(dry_run=not live, signal_max_age_s=signal_max_age)
+    if not results:
+        console.print("[dim]No recent signals to execute.[/]")
+        return
+    t = Table("Submitted", "Reason", "Order ID")
+    for r in results:
+        t.add_row(str(r.submitted), r.reason[:80], r.order_id or "")
+    console.print(t)
+
+
+@app.command()
+def halt(reason: str = typer.Argument(..., help="Why are you halting?")):
+    """Halt all live execution. Affects the --live flag only."""
+    halt_execution(reason)
+    console.print(f"[red]HALTED: {reason}[/]")
+
+
+@app.command()
+def unhalt():
+    """Lift the halt flag. Investigate root cause first."""
+    unhalt_execution()
+    console.print("[green]Halt lifted.[/]")
+
+
+@app.command(name="live-log")
+def live_log(tail: int = typer.Option(20, help="Last N records.")):
+    """Show recent live-execution records (submitted + rejected)."""
+    recs = read_live_records()[-tail:]
+    if not recs:
+        console.print("[dim]No live-execution records.[/]")
+        return
+    t = Table("Time", "Subm", "Side", "Market", "Outcome", "$", "Price", "Reason")
+    for r in recs:
+        t.add_row(
+            time.strftime("%H:%M:%S", time.gmtime(r.ts_unix)),
+            "Y" if r.submitted else "n",
+            r.side, r.market_id[:10], r.outcome[:12],
+            f"${r.dollar_size:.0f}", f"{r.price:.3f}",
+            r.reason[:30],
+        )
+    console.print(t)
 
 
 @app.command()

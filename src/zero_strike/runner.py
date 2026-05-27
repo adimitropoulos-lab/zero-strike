@@ -23,10 +23,18 @@ import httpx
 from rich.console import Console
 
 from .agent import run_agent
-from .analytics import compute_edge, scan_top_wallets, select_repeatable_edge
+from .analytics import (
+    CohortMember,
+    CohortSnapshot,
+    cohort_store,
+    compute_edge,
+    scan_top_wallets,
+    select_repeatable_edge,
+)
 from .arb import scan_arbitrage
 from .calibration.daemon import sweep_once
 from .execution.signal import Signal, signal_store
+from .observability import start_metrics_server
 from .polymarket import SubgraphClient
 
 
@@ -43,6 +51,7 @@ class Runner:
         resolution_interval: int = 3600,
         agent_news_window: int = 600,
         webhook_url: str | None = None,
+        metrics_port: int | None = 9090,
     ):
         self.arb_interval = arb_interval
         self.agent_interval = agent_interval
@@ -50,6 +59,7 @@ class Runner:
         self.resolution_interval = resolution_interval
         self.agent_news_window = agent_news_window
         self.webhook_url = webhook_url or os.getenv("SIGNAL_WEBHOOK_URL")
+        self.metrics_port = metrics_port
         self._last_signal_count = len(signal_store.read())
         self._stop = asyncio.Event()
         self._cohort: list[str] = []
@@ -123,6 +133,19 @@ class Runner:
                 reports.append(compute_edge(w.address, fills))
         picks = select_repeatable_edge(reports, n=7, min_trades=25)
         self._cohort = [r.address for r, _, _ in picks]
+        if picks:
+            snap = CohortSnapshot(
+                selected_unix=int(time.time()),
+                lookback_days=90,
+                members=[
+                    CohortMember(
+                        address=rep.address, composite_z=z, win_rate=rep.win_rate,
+                        n_trades=rep.n_trades, pnl_usd=rep.pnl_usd,
+                    )
+                    for rep, z, _ in picks
+                ],
+            )
+            cohort_store.save(snap)
         console.print(
             f"[magenta][{_ts()}] [traders] cohort: "
             + (", ".join(a[:8] + "…" for a in self._cohort) or "(none met bar)")
@@ -156,6 +179,12 @@ class Runner:
                         console.print(f"[red][webhook] {type(e).__name__}: {e}[/]")
 
     async def run(self) -> None:
+        if self.metrics_port:
+            try:
+                start_metrics_server(host="0.0.0.0", port=self.metrics_port)
+                console.print(f"[bold]metrics → http://0.0.0.0:{self.metrics_port}/metrics[/]")
+            except OSError as e:
+                console.print(f"[yellow]metrics server skipped: {e}[/]")
         console.print(
             f"[bold]Zero-Strike runner up — arb/{self.arb_interval}s, "
             f"agent/{self.agent_interval}s, traders/{self.traders_interval}s, "

@@ -92,7 +92,12 @@ def _parse_feed(xml_text: str, fallback_source: str) -> list[NewsItem]:
 
 
 def fetch_news(
-    *, feeds: list[str] | None = None, max_per_feed: int = 25, since_seconds: int = 3600
+    *,
+    feeds: list[str] | None = None,
+    max_per_feed: int = 25,
+    since_seconds: int = 3600,
+    include_bluesky: bool = True,
+    include_twitter: bool = True,
 ) -> list[NewsItem]:
     feeds = feeds or list(settings.rss_feeds)
     cutoff = time.time() - since_seconds
@@ -108,5 +113,29 @@ def fetch_news(
                 if item.published_unix < cutoff:
                     continue
                 out.append(item)
-    out.sort(key=lambda x: x.published_unix, reverse=True)
-    return out
+    # Lazy import to keep the base fetcher dep-free.
+    if include_bluesky:
+        try:
+            from .sources.bluesky import fetch_bluesky
+
+            out.extend(fetch_bluesky(since_seconds=since_seconds))
+        except Exception:
+            pass
+    if include_twitter:
+        try:
+            from .sources.twitter import fetch_twitter
+
+            out.extend(fetch_twitter(since_seconds=since_seconds))
+        except Exception:
+            pass
+    # Dedupe by (source, title) to avoid posting the same headline twice across mirrors.
+    seen: set[tuple[str, str]] = set()
+    deduped: list[NewsItem] = []
+    for it in out:
+        key = (it.source, it.title.strip().lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(it)
+    deduped.sort(key=lambda x: x.published_unix, reverse=True)
+    return deduped

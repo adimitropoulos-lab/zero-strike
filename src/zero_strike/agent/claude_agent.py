@@ -23,6 +23,7 @@ from ..calibration import compute_stats, format_calibration_for_prompt, resoluti
 from ..config import settings
 from ..execution.signal import signal_store
 from .budget import check_budget, daily_cap_usd, record_usage, spend_store
+from .cohort_feed import CohortInput
 from .news_feed import NewsItem
 from .tools import TOOLS, close_clients, run_tool
 
@@ -87,7 +88,13 @@ def _build_system_prompt() -> str:
     return SYSTEM_PROMPT + suffix
 
 
-def run_agent_on_news(items: Iterable[NewsItem], *, max_steps: int = 40, verbose: bool = True) -> dict:
+def run_agent_on_news(
+    items: Iterable[NewsItem],
+    *,
+    cohort_inputs: Iterable[CohortInput] | None = None,
+    max_steps: int = 40,
+    verbose: bool = True,
+) -> dict:
     """Run the agent until end_turn or max_steps. Returns a run summary."""
     if not settings.anthropic_api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not set — cannot run agent.")
@@ -102,14 +109,23 @@ def run_agent_on_news(items: Iterable[NewsItem], *, max_steps: int = 40, verbose
     system_prompt = _build_system_prompt()
 
     news_block = "\n\n".join(f"- {it.as_text()}" for it in items)
-    if not news_block.strip():
-        return {"stop": "no_news", "tool_calls": 0, "messages": 0}
+    cohort_block = "\n\n".join(c.text for c in (cohort_inputs or []))
+    if not news_block.strip() and not cohort_block.strip():
+        return {"stop": "no_input", "tool_calls": 0, "messages": 0}
 
+    sections = []
+    if news_block.strip():
+        sections.append("## News\n\n" + news_block)
+    if cohort_block.strip():
+        sections.append(
+            "## Cohort activity (recent fills from our 7 repeatable-edge wallets — treat "
+            "these as smart-money tells, not absolute truth)\n\n" + cohort_block
+        )
     user_intro = (
-        "Here are the freshest news items. Process them under your operating rules and "
+        "Here are the freshest inputs. Process them under your operating rules and "
         "emit signals for anything actionable. Be concise in your reasoning text — the "
         "tool calls and emit_signal payloads are the real output.\n\n"
-        f"{news_block}"
+        + "\n\n".join(sections)
     )
 
     messages: list[dict] = [{"role": "user", "content": user_intro}]

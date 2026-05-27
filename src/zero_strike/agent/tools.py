@@ -9,12 +9,14 @@ import json
 from dataclasses import asdict
 from typing import Any
 
+from ..analytics import poll_new_activity
 from ..arb.scanner import _check_market
 from ..config import settings
 from ..execution.signal import Signal, signal_store
 from ..polymarket import ClobClient, GammaClient
 from ..sizing.kelly import kelly_size
 from ..sizing.portfolio import adjust_for_portfolio
+from .embeddings import cosine, embed
 
 
 TOOLS: list[dict[str, Any]] = [
@@ -98,6 +100,21 @@ TOOLS: list[dict[str, Any]] = [
                 "event_id": {"type": "string", "description": "Polymarket event_id (from search_markets or get_market_prices). Pass it whenever known so correlated bets are sized correctly."},
             },
             "required": ["p_true", "p_market"],
+        },
+    },
+    {
+        "name": "get_cohort_activity",
+        "description": (
+            "Pull recent fills from the 7-trader repeatable-edge cohort. Use when "
+            "you want to check if a market you're considering has recent insider buying "
+            "from wallets we've identified as having edge. Returns up to N most recent fills."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "lookback_seconds": {"type": "integer", "default": 3600, "minimum": 60},
+                "min_usdc": {"type": "number", "default": 250},
+            },
         },
     },
     {
@@ -203,23 +220,55 @@ def _market_summary(market: dict) -> dict:
     }
 
 
+def _market_text(market: dict) -> str:
+    return " ".join(
+        str(x or "")
+        for x in (market.get("question"), market.get("description"), market.get("slug"))
+    )
+
+
 def _search_markets(query: str, limit: int = 10) -> list[dict]:
-    q = query.lower().strip()
+    """Semantic search if an embedding provider is configured, else keyword overlap.
+
+    Keyword fallback is still useful — many news items map to markets via direct
+    name matches ("Trump", "Bitcoin", country names) where overlap is enough.
+    """
     gamma = _gamma_client()
-    # Score markets by token overlap with the query — Gamma has no full-text endpoint.
+    pool: list[dict] = []
+    for market in gamma.iter_markets(active=True, closed=False, order="volume24hr", page=200):
+        pool.append(market)
+        if len(pool) >= 600:
+            break
+    if not pool:
+        return []
+
+    # Try embeddings first.
+    query_vec = embed([query])
+    if query_vec is not None:
+        # Cache-friendly: embed market texts in one batch (cache hits are free).
+        market_texts = [_market_text(m) for m in pool]
+        market_vecs = embed(market_texts)
+        if market_vecs is not None:
+            qv = query_vec[0]
+            scored = [
+                (cosine(qv, mv), m)
+                for mv, m in zip(market_vecs, pool)
+            ]
+            scored.sort(key=lambda x: (x[0], float(x[1].get("volume24hr") or 0)), reverse=True)
+            top = [m for sim, m in scored[:limit] if sim > 0.25]  # quality floor
+            if top:
+                return [_market_summary(m) for m in top]
+
+    # Keyword fallback.
+    q = query.lower().strip()
     tokens = {t for t in q.replace("?", "").replace(",", " ").split() if len(t) > 2}
     scored: list[tuple[int, dict]] = []
-    for market in gamma.iter_markets(active=True, closed=False, order="volume24hr", page=200):
-        text = " ".join(
-            str(x or "").lower()
-            for x in (market.get("question"), market.get("description"), market.get("slug"))
-        )
+    for market in pool:
+        text = _market_text(market).lower()
         overlap = sum(1 for t in tokens if t in text)
         if overlap == 0:
             continue
         scored.append((overlap, market))
-        if len(scored) >= 400:
-            break
     scored.sort(key=lambda x: (x[0], float(x[1].get("volume24hr") or 0)), reverse=True)
     return [_market_summary(m) for _, m in scored[:limit]]
 
@@ -304,6 +353,22 @@ def _size_with_kelly(
     }
 
 
+def _get_cohort_activity(lookback_seconds: int = 3600, min_usdc: float = 250.0) -> list[dict]:
+    fills = poll_new_activity(lookback_seconds=lookback_seconds, min_usdc=min_usdc)
+    return [
+        {
+            "address": f.address,
+            "timestamp": f.timestamp,
+            "side": f.side,
+            "token_id": f.token_id,
+            "usdc_amount": round(f.usdc_amount, 2),
+            "share_amount": round(f.share_amount, 4),
+            "avg_price": round(f.avg_price, 6),
+        }
+        for f in fills[:50]
+    ]
+
+
 def _emit_signal(event_id: str | None = None, **kwargs) -> dict:
     # Encode event_id into news_refs as 'event:<id>' for portfolio clustering
     # without breaking the existing Signal schema.
@@ -322,6 +387,7 @@ _HANDLERS = {
     "simulate_fill": _simulate_fill,
     "check_arbitrage": _check_arbitrage,
     "size_with_kelly": _size_with_kelly,
+    "get_cohort_activity": _get_cohort_activity,
     "emit_signal": _emit_signal,
 }
 
