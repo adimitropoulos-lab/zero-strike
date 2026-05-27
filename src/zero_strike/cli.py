@@ -8,6 +8,8 @@ Commands:
   agent        Run the news-driven agent loop (fetch RSS → Claude → signals).
   resolve      Settle any signals whose markets have closed.
   calibration  Show Brier / hit-rate / PnL / reliability buckets.
+  backtest     Replay resolved signals under different sizing parameters.
+  portfolio    Show open exposure by event (cluster view).
   run          One-click: run arb + agent + traders + resolution loops forever.
   signals      List recorded signals.
   config       Print resolved settings.
@@ -23,12 +25,14 @@ from rich.table import Table
 
 from .analytics import compute_edge, scan_top_wallets, select_repeatable_edge
 from .arb import scan_arbitrage
+from .backtest import sweep_parameters
+from .backtest.replay import replay
 from .calibration import compute_stats, resolution_store
 from .calibration.daemon import sweep_once
 from .config import settings
 from .execution.signal import signal_store
 from .polymarket import SubgraphClient
-from .sizing import kelly_size
+from .sizing import kelly_size, open_exposure_by_event
 
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help=__doc__)
@@ -222,6 +226,71 @@ def calibration():
             f"{drift:+.2f}",
         )
     console.print(buckets)
+
+
+@app.command()
+def backtest(
+    sweep: bool = typer.Option(False, help="Sweep parameter grid (default: single replay with live settings)."),
+    kelly: float = typer.Option(None, help="Kelly multiplier for the single replay."),
+    max_position: float = typer.Option(None, help="Max position % of bankroll for the single replay."),
+    min_edge: int = typer.Option(None, help="Min edge in bps for the single replay."),
+):
+    """Replay resolved signals under different sizing parameters."""
+    if not sweep:
+        r = replay(
+            bankroll=settings.bankroll,
+            kelly_fraction=kelly if kelly is not None else settings.kelly_fraction,
+            max_position_pct=max_position if max_position is not None else settings.max_position_pct,
+            min_edge_bps=min_edge if min_edge is not None else settings.min_edge_bps,
+        )
+        t = Table("Metric", "Value")
+        t.add_row("signals total", str(r.n_signals))
+        t.add_row("signals resolved+replayed", str(r.n_resolved))
+        t.add_row("total PnL", f"${r.total_pnl_usd:,.2f}")
+        t.add_row("win rate", f"{r.win_rate*100:.1f}%")
+        t.add_row("Sharpe", f"{r.sharpe:.2f}" if r.sharpe is not None else "—")
+        t.add_row("max drawdown", f"${r.max_drawdown_usd:,.2f}")
+        t.add_row("avg size", f"${r.avg_dollar_size:,.2f}")
+        t.add_row("avg edge (bps)", f"{r.avg_edge_bps:+.0f}")
+        t.add_row("kelly multiplier", f"{r.kelly_fraction}")
+        t.add_row("max position pct", f"{r.max_position_pct}")
+        t.add_row("min edge bps", f"{r.min_edge_bps}")
+        console.print(t)
+        return
+
+    sr = sweep_parameters(bankroll=settings.bankroll)
+    top = sr.by_sharpe()[:10]
+    table = Table("Rank", "Kelly", "MaxPos%", "MinEdge", "Resolved", "PnL", "Sharpe", "MaxDD", "WinRate")
+    for i, r in enumerate(top, 1):
+        table.add_row(
+            str(i),
+            f"{r.kelly_fraction}",
+            f"{r.max_position_pct}",
+            str(r.min_edge_bps),
+            str(r.n_resolved),
+            f"${r.total_pnl_usd:,.0f}",
+            f"{r.sharpe:.2f}" if r.sharpe is not None else "—",
+            f"${r.max_drawdown_usd:,.0f}",
+            f"{r.win_rate*100:.1f}%",
+        )
+    console.print(table)
+    if not top or top[0].n_resolved == 0:
+        console.print("[yellow]No resolved signals to replay — let the agent run.[/]")
+
+
+@app.command()
+def portfolio():
+    """Open exposure by event cluster — what's already at risk."""
+    by_event = open_exposure_by_event()
+    if not by_event:
+        console.print("[yellow]No open exposure by event.[/]")
+        return
+    table = Table("Event", "Open Signals", "Dollar Exposure", "Markets")
+    for event_id, items in sorted(by_event.items(), key=lambda x: -sum(i["dollar_size"] for i in x[1])):
+        total = sum(i["dollar_size"] for i in items)
+        markets = ", ".join(sorted({i["market_id"][:10] for i in items}))[:60]
+        table.add_row(event_id[:16], str(len(items)), f"${total:,.2f}", markets)
+    console.print(table)
 
 
 @app.command()
